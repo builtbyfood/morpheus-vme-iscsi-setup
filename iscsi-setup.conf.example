@@ -1,0 +1,108 @@
+# =============================================================================
+# vme-iscsi-setup — example configuration
+# =============================================================================
+#
+# Copy to iscsi-setup.conf and edit, or pass with --config <path>.
+# Anything left blank is prompted for interactively at runtime.
+#
+# To see your host's NICs before filling this out:
+#   sudo ./vme-iscsi-setup.sh --list-nics
+#
+# If you store CHAP secrets in this file, lock it down:
+#   chmod 600 iscsi-setup.conf
+#
+# =============================================================================
+# Target (storage array) settings
+# =============================================================================
+
+# IQN of the iSCSI target the host should mount.
+# Common formats by vendor:
+#   QNAP:      iqn.YYYY-MM.com.qnap:ts-XXXX:iscsi.target-N.xxxxxxxx
+#   TrueNAS:   iqn.YYYY-MM.org.freenas.ctl:targetname
+#   Synology:  iqn.YYYY-MM.com.synology:diskstation.targetN
+#   Pure:      iqn.YYYY-MM.com.purestorage:flasharray.xxxxxxxxxx
+TARGET_IQN=""
+
+# One or more target portal IPs, space-separated.
+# Single-controller arrays typically advertise one portal.
+# Dual-controller / active-active SANs advertise two.
+#   TARGET_PORTALS="10.10.20.10"
+#   TARGET_PORTALS="10.10.20.10 10.10.20.11"
+TARGET_PORTALS=""
+
+# iSCSI TCP port. Default is 3260; only change if your array uses a non-standard port.
+TARGET_PORT="3260"
+
+# =============================================================================
+# Initiator (this host) settings
+# =============================================================================
+
+# Storage NIC names on THIS host, space-separated. These must already be
+# configured with IPs in the storage subnet — this script verifies them but
+# does NOT touch netplan / NetworkManager / ifcfg files.
+#
+# Run `sudo ./vme-iscsi-setup.sh --list-nics` to see what's available.
+# Names vary by host: eno3/eno4, enp3s0f0/enp3s0f1, ens1f0/ens1f1, etc.
+STORAGE_NICS=""
+
+# iSCSI iface names to create, in the same order as STORAGE_NICS.
+# Leave blank to auto-derive as iface_<nicname>.
+#   ISCSI_IFACES="iface_eno3 iface_eno4"
+ISCSI_IFACES=""
+
+# Expected MTU on the storage NICs. Used for jumbo-frame validation
+# (the script pings with the DF bit set and the corresponding payload size).
+# Common values: 1500 (standard) or 9000 (jumbo).
+EXPECTED_MTU="9000"
+
+# Set a custom InitiatorName for this host?
+#   "yes" -> generate iqn.YYYY-MM.<reverse-domain>:<hostname> and write it
+#   "no"  -> leave whatever is already in /etc/iscsi/initiatorname.iscsi
+#   ""    -> ask interactively
+SET_INITIATOR_NAME=""
+
+# If SET_INITIATOR_NAME=yes and you want to override the auto-generated value,
+# set the full IQN here. Otherwise leave blank.
+#   INITIATOR_NAME_OVERRIDE="iqn.2025-01.com.example:host-01"
+INITIATOR_NAME_OVERRIDE=""
+
+# =============================================================================
+# CHAP
+# =============================================================================
+
+# Enable one-way CHAP (target authenticates the initiator)?
+#   "yes" / "no" / "" to ask
+USE_CHAP=""
+
+# CHAP credentials. Three ways to supply them, in order of precedence:
+#   1. ISCSI_CHAP_USER / ISCSI_CHAP_PASS environment variables
+#   2. These config values
+#   3. No-echo interactive prompt
+#
+# If you put secrets here, chmod 600 the file.
+# Per iSCSI spec, CHAP passwords should be 12-16 characters.
+CHAP_USER=""
+CHAP_PASS=""
+
+# =============================================================================
+# Multipath
+# =============================================================================
+
+# Write /etc/multipath.conf with cluster-safe defaults
+# (user_friendly_names no, find_multipaths yes)?
+# Required for GFS2 — every node must see the same /dev/mapper/<wwid> path.
+#   "yes" -> write (backing up any existing file to .bak-<timestamp>)
+#   "no"  -> verify only; abort if existing config has user_friendly_names yes
+#   ""    -> ask
+WRITE_MULTIPATH_CONF=""
+
+# =============================================================================
+# Behaviour
+# =============================================================================
+
+# What to do if discovery, CHAP, or login succeeds on one path but fails on
+# another:
+#   "prompt"   -> ask at the decision point (default)
+#   "continue" -> warn and proceed with working paths
+#   "abort"    -> hard stop
+PARTIAL_PATH_POLICY="prompt"
