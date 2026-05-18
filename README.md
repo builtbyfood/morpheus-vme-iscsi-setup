@@ -21,7 +21,7 @@ incident.
 |------:|--------------|
 | **1 · Configuration** | Loads config file (if present), env vars (`ISCSI_CHAP_USER`/`ISCSI_CHAP_PASS`), or prompts interactively. Always ends with a summary table and a `y/N` confirm. |
 | **2 · Pre-flight** | Read-only checks: package presence, service state, NIC link / IPv4 / MTU, ping + jumbo-ping with DF bit, TCP 3260 reachable from each NIC × each portal, existing iSCSI state. Asks before installing missing packages. |
-| **3 · Apply** | Initiator name → multipath.conf → iSCSI ifaces → discovery → node-record binding → login + CHAP (interleaved) → autostart. Idempotent. |
+| **3 · Apply** | Initiator name → multipath.conf → iSCSI ifaces → discovery → node-record binding → iSCSI tuning → login + CHAP (interleaved) → autostart. Idempotent. |
 | **4 · Verify** | `iscsiadm -m session`, `multipath -ll`, `lsblk`, and a WWID summary you can copy-paste into the Morpheus GFS2 GUI. |
 
 ---
@@ -44,6 +44,29 @@ incident.
   configure them.**
 - For `--remote-hosts` mode: passwordless SSH + sudo on each remote host,
   and a populated config file (interactive prompts don't work over batch SSH).
+
+---
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/builtbyfood/morpheus-vme-iscsi-setup.git
+cd vme-iscsi-setup
+chmod +x vme-iscsi-setup.sh
+```
+
+Or grab just the script (and config example) without git:
+
+```bash
+curl -LO https://raw.githubusercontent.com/builtbyfood/morpheus-vme-iscsi-setup/main/vme-iscsi-setup.sh
+curl -LO https://raw.githubusercontent.com/builtbyfood/morpheus-vme-iscsi-setup/main/iscsi-setup.conf.example
+chmod +x vme-iscsi-setup.sh
+```
+
+The script has no runtime dependencies beyond what `iscsiadm`, `multipath`,
+and the standard GNU toolchain provide — drop it on a host and run.
 
 ---
 
@@ -96,6 +119,8 @@ annotated version.
 | `USE_CHAP` | no | `yes`/`no`. Default ask. |
 | `CHAP_USER` / `CHAP_PASS` | conditional | Required when `USE_CHAP=yes`, unless supplied via env vars or interactive prompt. |
 | `WRITE_MULTIPATH_CONF` | no | `yes` (default for new installs) writes cluster-safe `/etc/multipath.conf` with a backup. `no` verifies the existing file and aborts if `user_friendly_names yes` is set (incompatible with GFS2). |
+| `ISCSI_TUNING_PROFILE` | no | `default` (leave OS values), `conservative` (`cmds_max=1024`, `queue_depth=128`), `fast` (`cmds_max=2048`, `queue_depth=256` — for fast all-flash arrays like HPE Alletra MP B1000), or `custom`. |
+| `ISCSI_CMDS_MAX` / `ISCSI_QUEUE_DEPTH` | conditional | Required when `ISCSI_TUNING_PROFILE=custom`. Positive integers, `queue_depth <= cmds_max`. |
 | `PARTIAL_PATH_POLICY` | no | `prompt` (default), `continue`, or `abort`. Behaviour when one MPIO path works and another doesn't. |
 
 ### CHAP secret precedence
@@ -209,6 +234,11 @@ prompts for every value, handy for one-off hosts) and **config-file driven**
 ► Node records
   record iface_eno3 → 10.10.20.10 ........................... ✓ created
   record iface_eno4 → 10.10.20.10 ........................... ✓ created
+► iSCSI tuning
+  iscsid.conf updated ....................................... ✓ cmds_max=2048 queue_depth=256
+  iscsid restarted .......................................... ✓
+  tuned iface_eno3 → 10.10.20.10 ............................ ✓ cmds=2048 qd=256
+  tuned iface_eno4 → 10.10.20.10 ............................ ✓ cmds=2048 qd=256
 ► Login + CHAP
   login iface_eno3 (initial) ................................ ⚠ expected — CHAP not set yet
   CHAP iface_eno3 → 10.10.20.10 ............................. ✓
@@ -333,6 +363,24 @@ For a brand-new MPIO setup, partial is almost always a network problem (one
 NIC has no IP, wrong VLAN, blocked port, etc.) — investigate before
 continuing.
 
+### iSCSI queue depth feels too shallow on fast flash
+
+The OS defaults for `iscsid.conf` (`cmds_max=128`, `queue_depth=32`) are
+conservative and noticeably bottleneck modern all-flash arrays. Run with
+`ISCSI_TUNING_PROFILE=fast` (or `conservative` for a milder bump) and the
+script will:
+
+1. Update `/etc/iscsi/iscsid.conf` (backed up to `.bak-<timestamp>`) so any
+   future iSCSI targets on the host inherit the higher values.
+2. Apply the values directly to the node records for the current target via
+   `iscsiadm -m node ... --op=update`, so they take effect at next login on
+   this run.
+3. Restart `iscsid`.
+
+Live pre-existing sessions retain their original negotiated values until
+the next logout/login or reboot — that's protocol behaviour, not a script
+limitation.
+
 ### Logs
 
 Every run writes to `/var/log/vme-iscsi-setup-<hostname>-<timestamp>.log`
@@ -348,14 +396,45 @@ tree after discovery — gold for postmortems.
 vme-iscsi-setup.sh         Main script.
 iscsi-setup.conf.example   Annotated config template.
 README.md                  This file.
+LICENSE                    MIT license text.
 images/                    Screenshots referenced from this README.
 ```
 
 ---
 
+## Known limitations
+
+- **One target per run.** Configure multiple iSCSI targets by running the
+  script once per target. Re-running on the same host with a new target is
+  safe — existing ifaces/sessions for prior targets are untouched.
+- **No NIC configuration.** Storage NIC IPs / MTU / VLANs must be set at the
+  OS level (netplan / NetworkManager / ifcfg) before running. The script
+  verifies but does not change them.
+- **No target IQN auto-discovery.** You provide the IQN; the script uses
+  sendtargets against the portal you specify.
+- **Queue depth changes apply at next login.** Live pre-existing iSCSI
+  sessions retain their originally negotiated values until logout/login or
+  reboot — iSCSI protocol behaviour, not a script limitation.
+- **IPv4 portals only.** The IP-format validator only matches IPv4; IPv6
+  portals would currently be rejected at the input check even though
+  `iscsiadm` itself supports them.
+
+---
+
+## Acknowledgements
+
+- **Sean Jabro** and the HPE team for the [GFS2 datastore configuration
+  walkthrough](https://www.hpe.com/emea_europe/en/resource-library.video.configuring-shared-storage-setting-up-and-adding-a-gfs2-datastore.v100006436.html)
+  this script automates.
+- Community contributors who flagged that the iSCSI defaults
+  (`cmds_max=128`, `queue_depth=32`) bottleneck modern flash arrays — that
+  feedback became the `ISCSI_TUNING_PROFILE` feature in v1.1.0.
+
+---
+
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE) for the full text.
 
 ---
 

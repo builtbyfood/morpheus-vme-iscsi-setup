@@ -25,7 +25,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_NAME="vme-iscsi-setup"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -383,6 +383,9 @@ CHAP_USER=""
 CHAP_PASS=""
 WRITE_MULTIPATH_CONF=""
 PARTIAL_PATH_POLICY="prompt"
+ISCSI_TUNING_PROFILE=""
+ISCSI_CMDS_MAX=""
+ISCSI_QUEUE_DEPTH=""
 
 load_config_file() {
     local path="$OPT_CONFIG"
@@ -515,6 +518,29 @@ interactive_fill() {
             WRITE_MULTIPATH_CONF="no"
         fi
     fi
+
+    if [[ -z "$ISCSI_TUNING_PROFILE" ]]; then
+        ISCSI_TUNING_PROFILE=$(ui_choice "iSCSI session tuning (queue depth + cmds_max)" "default" \
+            "default" "conservative" "fast" "custom")
+    fi
+    if [[ "$ISCSI_TUNING_PROFILE" == "custom" ]]; then
+        while :; do
+            [[ -z "$ISCSI_CMDS_MAX"    ]] && ISCSI_CMDS_MAX=$(ui_prompt   "  node.session.cmds_max" "1024")
+            [[ -z "$ISCSI_QUEUE_DEPTH" ]] && ISCSI_QUEUE_DEPTH=$(ui_prompt "  node.session.queue_depth" "128")
+            if ! [[ "$ISCSI_CMDS_MAX"    =~ ^[0-9]+$ ]] || (( ISCSI_CMDS_MAX    < 1 )); then
+                ui_warn "cmds_max must be a positive integer"; ISCSI_CMDS_MAX=""; continue
+            fi
+            if ! [[ "$ISCSI_QUEUE_DEPTH" =~ ^[0-9]+$ ]] || (( ISCSI_QUEUE_DEPTH < 1 )); then
+                ui_warn "queue_depth must be a positive integer"; ISCSI_QUEUE_DEPTH=""; continue
+            fi
+            if (( ISCSI_QUEUE_DEPTH > ISCSI_CMDS_MAX )); then
+                ui_warn "queue_depth ($ISCSI_QUEUE_DEPTH) > cmds_max ($ISCSI_CMDS_MAX) is unusual"
+                if ui_confirm "Continue anyway?" "n"; then break; fi
+                ISCSI_CMDS_MAX=""; ISCSI_QUEUE_DEPTH=""; continue
+            fi
+            break
+        done
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -542,6 +568,12 @@ show_summary() {
         kv "Initiator name"  "(leave existing)"
     fi
     kv "CHAP"                "$USE_CHAP$( [[ "$USE_CHAP" == "yes" ]] && printf '  user=%s  pass=%s' "$CHAP_USER" "$(printf '%*s' ${#CHAP_PASS} '' | tr ' ' '*')" )"
+    case "${ISCSI_TUNING_PROFILE:-default}" in
+        default|"")   kv "iSCSI tuning" "default (OS values, conservative)" ;;
+        conservative) kv "iSCSI tuning" "conservative (cmds_max=1024, queue_depth=128)" ;;
+        fast)         kv "iSCSI tuning" "fast (cmds_max=2048, queue_depth=256)" ;;
+        custom)       kv "iSCSI tuning" "custom (cmds_max=$ISCSI_CMDS_MAX, queue_depth=$ISCSI_QUEUE_DEPTH)" ;;
+    esac
     kv "Write multipath.conf" "$WRITE_MULTIPATH_CONF"
     kv "Partial path policy" "$PARTIAL_PATH_POLICY"
     kv "Log file"            "$LOG_FILE"
@@ -898,6 +930,84 @@ ensure_node_records() {
     done
 }
 
+# Update or insert a "key = value" line in /etc/iscsi/iscsid.conf, handling
+# both uncommented and commented-out existing definitions.
+set_iscsid_conf_value() {
+    local f="$1" key="$2" value="$3"
+    local key_re; key_re=$(printf '%s' "$key" | sed 's/[][\.*^$/]/\\&/g')
+    if grep -qE "^[[:space:]#]*${key_re}[[:space:]]*=" "$f"; then
+        sed -i -E "s|^[[:space:]#]*${key_re}[[:space:]]*=.*|${key} = ${value}|" "$f"
+    else
+        printf '\n%s = %s\n' "$key" "$value" >>"$f"
+    fi
+}
+
+# Apply queue-depth / cmds_max tuning. Updates iscsid.conf (the template used
+# for any future iSCSI targets on this host), restarts iscsid, and also writes
+# the values directly to the existing node records for THIS target so they
+# apply at next login on this run — not just to future targets.
+#
+# Existing live sessions retain their original negotiated values until next
+# logout/login or reboot; that's iSCSI protocol behaviour, not a bug.
+apply_iscsid_tuning() {
+    if [[ -z "$ISCSI_TUNING_PROFILE" ]] || [[ "$ISCSI_TUNING_PROFILE" == "default" ]]; then
+        ui_check "iSCSI tuning" skip "leaving OS defaults"
+        return
+    fi
+
+    local cmds_max queue_depth
+    case "$ISCSI_TUNING_PROFILE" in
+        conservative) cmds_max=1024; queue_depth=128 ;;
+        fast)         cmds_max=2048; queue_depth=256 ;;
+        custom)       cmds_max="$ISCSI_CMDS_MAX"; queue_depth="$ISCSI_QUEUE_DEPTH" ;;
+        *)            ui_check "iSCSI tuning" fail "unknown profile: $ISCSI_TUNING_PROFILE"; return ;;
+    esac
+
+    # 1) Update iscsid.conf for FUTURE node records on this host
+    local f=/etc/iscsi/iscsid.conf
+    if [[ -f "$f" ]]; then
+        cp -a "$f" "${f}.bak-$(date +%Y%m%d-%H%M%S)"
+        set_iscsid_conf_value "$f" "node.session.cmds_max"    "$cmds_max"
+        set_iscsid_conf_value "$f" "node.session.queue_depth" "$queue_depth"
+        ui_check "iscsid.conf updated" ok "cmds_max=$cmds_max queue_depth=$queue_depth"
+        if systemctl restart iscsid >>"$LOG_FILE" 2>&1; then
+            ui_check "iscsid restarted" ok
+            sleep 1
+        else
+            ui_check "iscsid restarted" warn "non-fatal — values still written"
+        fi
+    else
+        ui_check "iscsid.conf" warn "not found at $f — global tuning skipped"
+    fi
+
+    # 2) Update existing node records for THIS target so values apply at login
+    local ifaces; read -ra ifaces <<<"$ISCSI_IFACES"
+    local i portal
+    for (( i=0; i<${#ifaces[@]}; i++ )); do
+        local iface="${ifaces[i]}"
+        for portal in $TARGET_PORTALS; do
+            local portal_spec="$portal"
+            if ! iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" >/dev/null 2>&1 \
+               && iscsiadm -m node -T "$TARGET_IQN" -p "${portal}:${TARGET_PORT}" -I "$iface" >/dev/null 2>&1; then
+                portal_spec="${portal}:${TARGET_PORT}"
+            fi
+            if iscsiadm -m node -T "$TARGET_IQN" -p "$portal_spec" -I "$iface" \
+                    --op=update -n node.session.cmds_max -v "$cmds_max" >>"$LOG_FILE" 2>&1 \
+               && iscsiadm -m node -T "$TARGET_IQN" -p "$portal_spec" -I "$iface" \
+                    --op=update -n node.session.queue_depth -v "$queue_depth" >>"$LOG_FILE" 2>&1; then
+                ui_check "tuned $iface → $portal" ok "cmds=$cmds_max qd=$queue_depth"
+            else
+                ui_check "tuned $iface → $portal" warn "per-record update failed (see log)"
+            fi
+        done
+    done
+
+    # 3) Warn if pre-existing sessions exist — they keep old values until re-login
+    if iscsiadm -m session 2>/dev/null | grep -q "$TARGET_IQN"; then
+        ui_info "pre-existing sessions retain old values until next logout/login or reboot"
+    fi
+}
+
 # Helper: write the three CHAP keys (authmethod, username, password) for one
 # (iface, portal) pair, with bare-IP→IP:port fallback. Returns 0 on success,
 # 1 on failure (the caller is responsible for handle_partial_failure).
@@ -1042,6 +1152,7 @@ phase_apply() {
     ui_step "iSCSI ifaces";    apply_ifaces
     ui_step "Discovery";       apply_discovery
     ui_step "Node records";    ensure_node_records
+    ui_step "iSCSI tuning";    apply_iscsid_tuning
     ui_step "Login + CHAP";    apply_login_and_chap
     ui_step "Autostart";       apply_autostart
     ui_phase_end
@@ -1198,6 +1309,11 @@ main() {
         [[ -z "$USE_CHAP" ]] && USE_CHAP="no"
         [[ -z "$SET_INITIATOR_NAME" ]] && SET_INITIATOR_NAME="no"
         [[ -z "$WRITE_MULTIPATH_CONF" ]] && WRITE_MULTIPATH_CONF="yes"
+        [[ -z "$ISCSI_TUNING_PROFILE" ]] && ISCSI_TUNING_PROFILE="default"
+        if [[ "$ISCSI_TUNING_PROFILE" == "custom" ]]; then
+            [[ -z "$ISCSI_CMDS_MAX" || -z "$ISCSI_QUEUE_DEPTH" ]] \
+                && ui_die "non-interactive + custom tuning requires ISCSI_CMDS_MAX and ISCSI_QUEUE_DEPTH"
+        fi
         if [[ "$USE_CHAP" == "yes" ]]; then
             [[ -z "$CHAP_USER" || -z "$CHAP_PASS" ]] && ui_die "non-interactive: CHAP enabled but credentials missing"
         fi

@@ -97,6 +97,33 @@ CHAP_PASS=""
 WRITE_MULTIPATH_CONF=""
 
 # =============================================================================
+# iSCSI session tuning (queue depth, max concurrent commands)
+# =============================================================================
+
+# OS defaults for iscsid.conf are conservative (cmds_max=128, queue_depth=32)
+# and become a real bottleneck on modern flash arrays. Pick a profile:
+#
+#   "default"      Leave OS defaults (no changes to iscsid.conf)
+#   "conservative" cmds_max=1024, queue_depth=128 — safe upgrade for most arrays
+#   "fast"         cmds_max=2048, queue_depth=256 — for fast all-flash arrays
+#                                                    (e.g. HPE Alletra MP B1000)
+#   "custom"       Use the values below
+#   ""             Ask interactively
+#
+# Changes are written to /etc/iscsi/iscsid.conf (with a timestamped backup)
+# AND applied directly to the existing node records for this target so they
+# take effect at next login on this run, not just on future targets.
+#
+# Note: pre-existing live sessions keep their negotiated values until next
+# logout/login or reboot. That's iSCSI protocol behaviour.
+ISCSI_TUNING_PROFILE=""
+
+# Used only when ISCSI_TUNING_PROFILE="custom". Must be positive integers,
+# and queue_depth should be <= cmds_max.
+ISCSI_CMDS_MAX=""
+ISCSI_QUEUE_DEPTH=""
+
+# =============================================================================
 # Behaviour
 # =============================================================================
 
