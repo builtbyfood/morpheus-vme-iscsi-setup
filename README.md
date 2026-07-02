@@ -21,8 +21,8 @@ incident.
 |------:|--------------|
 | **1 · Configuration** | Loads config file (if present), env vars (`ISCSI_CHAP_USER`/`ISCSI_CHAP_PASS`), or prompts interactively. Always ends with a summary table and a `y/N` confirm. |
 | **2 · Pre-flight** | Read-only checks: package presence, service state, NIC link / IPv4 / MTU, ping + jumbo-ping with DF bit, TCP 3260 reachable from each NIC × each portal, existing iSCSI state. Asks before installing missing packages. |
-| **3 · Apply** | Initiator name → multipath.conf → iSCSI ifaces → discovery → node-record binding → iSCSI tuning → login + CHAP (interleaved) → autostart. Idempotent. |
-| **4 · Verify** | `iscsiadm -m session`, `multipath -ll`, `lsblk`, and a WWID summary you can copy-paste into the Morpheus GFS2 GUI. |
+| **3 · Apply** | Initiator name → multipath.conf → iSCSI ifaces → single discovery + side-effect cleanup → per-pair node-record reconcile + create → iSCSI tuning → login + CHAP (interleaved per pair) → autostart per pair. Idempotent. |
+| **4 · Verify** | `iscsiadm -m session`, `multipath -ll`, `lsblk`, a WWID summary you can copy-paste into the Morpheus GFS2 GUI, and a reboot-persistence check that confirms `iscsid`, `multipathd`, the auto-login oneshot (`iscsi`/`open-iscsi`), and `node.startup=automatic` are all in place. |
 
 ---
 
@@ -52,7 +52,7 @@ incident.
 Clone the repository:
 
 ```bash
-git clone https://github.com/builtbyfood/morpheus-vme-iscsi-setup.git
+git clone https://github.com/builtbyfood/vme-iscsi-setup.git
 cd vme-iscsi-setup
 chmod +x vme-iscsi-setup.sh
 ```
@@ -60,8 +60,8 @@ chmod +x vme-iscsi-setup.sh
 Or grab just the script (and config example) without git:
 
 ```bash
-curl -LO https://raw.githubusercontent.com/builtbyfood/morpheus-vme-iscsi-setup/main/vme-iscsi-setup.sh
-curl -LO https://raw.githubusercontent.com/builtbyfood/morpheus-vme-iscsi-setup/main/iscsi-setup.conf.example
+curl -LO https://raw.githubusercontent.com/builtbyfood/vme-iscsi-setup/main/vme-iscsi-setup.sh
+curl -LO https://raw.githubusercontent.com/builtbyfood/vme-iscsi-setup/main/iscsi-setup.conf.example
 chmod +x vme-iscsi-setup.sh
 ```
 
@@ -113,6 +113,7 @@ annotated version.
 | `TARGET_PORT` | no | Default `3260`. |
 | `STORAGE_NICS` | yes | Space-separated NIC names on the host (e.g. `eno3 eno4`). |
 | `ISCSI_IFACES` | no | iSCSI iface names. Defaults to `iface_<nicname>`. |
+| `NIC_PORTAL_PAIRING` | conditional | Explicit `"nic:portal nic:portal ..."` pairing. Auto-derived positionally when `N == M`, or as fan-out/fan-in when either side is 1. Required only when both sides are ≥2 and unequal. |
 | `EXPECTED_MTU` | yes | `1500` or `9000`. Drives jumbo-ping validation. |
 | `SET_INITIATOR_NAME` | no | `yes`/`no`. Default `no` (leave existing). |
 | `INITIATOR_NAME_OVERRIDE` | no | Override the auto-generated IQN if `SET_INITIATOR_NAME=yes`. |
@@ -131,6 +132,36 @@ annotated version.
 
 If you store CHAP secrets in the config file, **`chmod 600` it**. The script
 warns you if it isn't.
+
+### NIC ↔ portal pairing
+
+Each storage NIC pairs with **exactly one** target portal — never all portals.
+Running discovery and login across every NIC × every portal produces a full
+mesh: on a two-NIC host talking to a dual-controller array, that's 4 iSCSI
+sessions and 4 multipath paths per LUN, when the correct topology is 2.
+
+The script picks the pairing based on your NIC and portal counts:
+
+| NICs (N) | Portals (M) | Pairing |
+|:---:|:---:|---|
+| N | N | Positional — `nics[i] ↔ portals[i]` |
+| 1 | M ≥ 1 | Single NIC talks to all M portals |
+| N ≥ 2 | 1 | All N NICs share the one portal (redundancy to single-controller arrays) |
+| N ≥ 2 | M ≥ 2, N ≠ M | Ambiguous — requires explicit `NIC_PORTAL_PAIRING` |
+
+Explicit form (space-separated `nic:portal`):
+
+```
+NIC_PORTAL_PAIRING="eno3:10.10.20.10 eno4:10.10.20.11"
+```
+
+**Cluster-wide convention worth adopting:** pair lower-numbered NICs with
+lower-numbered portals so operator debugging stays consistent across every
+host. Not enforced by the script, but it saves an hour the next time
+something goes sideways at 2 AM.
+
+The pairing is shown in the summary table before the `Proceed?` confirm — if
+it's not what you expected, back out and set `NIC_PORTAL_PAIRING` explicitly.
 
 ---
 
@@ -229,25 +260,28 @@ prompts for every value, handy for one-off hosts) and **config-file driven**
   iface iface_eno4 created .................................. ✓
     iface_eno4 → eno4 ....................................... ✓
 ► Discovery
-  discover iface_eno3 → 10.10.20.10 ......................... ✓ found iqn...
-  discover iface_eno4 → 10.10.20.10 ......................... ✓ found iqn...
+  discover default → 10.10.20.10 ............................ ✓ found iqn...
+  portal 10.10.20.10 advertised ............................. ✓
+  portal 10.10.20.11 advertised ............................. ✓
 ► Node records
+  reconcile ................................................. ✓ no stale records
   record iface_eno3 → 10.10.20.10 ........................... ✓ created
-  record iface_eno4 → 10.10.20.10 ........................... ✓ created
+  record iface_eno4 → 10.10.20.11 ........................... ✓ created
 ► iSCSI tuning
   iscsid.conf updated ....................................... ✓ cmds_max=2048 queue_depth=256
   iscsid restarted .......................................... ✓
   tuned iface_eno3 → 10.10.20.10 ............................ ✓ cmds=2048 qd=256
-  tuned iface_eno4 → 10.10.20.10 ............................ ✓ cmds=2048 qd=256
+  tuned iface_eno4 → 10.10.20.11 ............................ ✓ cmds=2048 qd=256
 ► Login + CHAP
   login iface_eno3 (initial) ................................ ⚠ expected — CHAP not set yet
   CHAP iface_eno3 → 10.10.20.10 ............................. ✓
   login iface_eno4 (initial) ................................ ⚠ expected — CHAP not set yet
-  CHAP iface_eno4 → 10.10.20.10 ............................. ✓
+  CHAP iface_eno4 → 10.10.20.11 ............................. ✓
   login iface_eno3 → 10.10.20.10 ............................ ✓
-  login iface_eno4 → 10.10.20.10 ............................ ✓
+  login iface_eno4 → 10.10.20.11 ............................ ✓
 ► Autostart
-  node.startup=automatic (10.10.20.10) ...................... ✓
+  node.startup=automatic (iface_eno3 → 10.10.20.10) ......... ✓
+  node.startup=automatic (iface_eno4 → 10.10.20.11) ......... ✓
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -307,6 +341,35 @@ the interactive prompt).
 ---
 
 ## Troubleshooting
+
+### Upgrading from v1.1.0 or earlier: mesh reconciliation
+
+v1.1.0 and earlier iterated `(nics × portals)` in discovery, node-record
+creation, login, and autostart — which quietly produced a full mesh (2×
+expected sessions and paths) on any host with ≥2 NICs and ≥2 portals.
+Single-portal setups were unaffected.
+
+v1.2.0 detects and cleans this up automatically. Running the fixed script
+against a mesh host will:
+
+1. Enumerate every node record on disk for the target.
+2. Compare against the expected pairing.
+3. For each stale record: **run a safety gate first** — check that losing
+   that iSCSI path would leave every LUN with ≥1 active multipath path.
+   Any LUN that would drop to zero paths aborts the reconcile with a clear
+   error before touching anything.
+4. Logout the live session, delete the record.
+5. Continue with the correct pair records.
+
+The safety gate exists because live-mounted GFS2 will withdraw
+**cluster-wide** — not just on the local node — the moment a mount loses
+all its paths. Never bypass it.
+
+If your production cluster is currently in mesh state and you're not
+comfortable letting the script drive the cleanup, the manual runbook is
+straightforward: for each host, one node at a time, `pcs cluster standby` →
+verify FS unmounted → `iscsiadm --logout` of the wrong-pair sessions →
+`iscsiadm -m node -o delete` those records → `pcs cluster unstandby`.
 
 ### `iscsiadm: No records found` during CHAP set
 
@@ -381,6 +444,30 @@ Live pre-existing sessions retain their original negotiated values until
 the next logout/login or reboot — that's protocol behaviour, not a script
 limitation.
 
+### Reboot persistence
+
+Four things must be in place for the iSCSI sessions to come back automatically
+after a reboot. The Phase 4 **Persistence (reboot survival)** block checks all
+four:
+
+| What | Why |
+|------|-----|
+| `iscsid.service` enabled at boot | The daemon any iscsiadm operation needs. |
+| `multipathd.service` enabled at boot | Reassembles the multipath device once both paths log in. |
+| `iscsi.service` (RHEL) / `open-iscsi.service` (Debian) enabled at boot | The oneshot that runs `iscsiadm -m node --loginall=automatic` during boot. **Without this enabled, `node.startup=automatic` does nothing.** |
+| `node.startup=automatic` set on the node records | Tells the oneshot above which records to log in. |
+
+The preflight phase enables the autologin oneshot if it's missing, and the
+Apply phase sets `node.startup=automatic` per portal. If the persistence
+block shows any failures, you can manually fix with:
+
+```bash
+sudo systemctl enable iscsid multipathd
+sudo systemctl enable iscsi          # RHEL/Rocky/Alma/Fedora
+sudo systemctl enable open-iscsi     # Debian/Ubuntu
+sudo iscsiadm -m node -T <iqn> -p <ip> --op update -n node.startup -v automatic
+```
+
 ### Logs
 
 Every run writes to `/var/log/vme-iscsi-setup-<hostname>-<timestamp>.log`
@@ -429,6 +516,9 @@ images/                    Screenshots referenced from this README.
 - Community contributors who flagged that the iSCSI defaults
   (`cmds_max=128`, `queue_depth=32`) bottleneck modern flash arrays — that
   feedback became the `ISCSI_TUNING_PROFILE` feature in v1.1.0.
+- Community feedback on a six-host VME 8+ cluster with a dual-portal QNAP
+  target that surfaced the NIC × portal Cartesian-loop bug — that report
+  became the pair-based topology model and reconciliation logic in v1.2.0.
 
 ---
 

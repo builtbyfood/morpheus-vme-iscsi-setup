@@ -18,14 +18,14 @@
 #  Cluster sweep:  ./vme-iscsi-setup.sh --config iscsi-setup.conf \
 #                       --remote-hosts host-a,host-b,host-c
 #
-#  Repo:    github.com/builtbyfood/morpheus-vme-iscsi-setup
+#  Repo:    (your fork)
 #  License: MIT
 # ============================================================================
 
 set -u
 set -o pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_NAME="vme-iscsi-setup"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -223,11 +223,14 @@ detect_distro() {
 
     case "$DISTRO_FAMILY" in
         debian)
-            PKG_ISCSI="open-iscsi";       PKG_MPATH="multipath-tools" ;;
+            PKG_ISCSI="open-iscsi";       PKG_MPATH="multipath-tools"
+            AUTOLOGIN_SVC="open-iscsi" ;;
         rhel)
-            PKG_ISCSI="iscsi-initiator-utils"; PKG_MPATH="device-mapper-multipath" ;;
+            PKG_ISCSI="iscsi-initiator-utils"; PKG_MPATH="device-mapper-multipath"
+            AUTOLOGIN_SVC="iscsi" ;;
         *)
-            PKG_ISCSI="iscsi-initiator-utils"; PKG_MPATH="device-mapper-multipath" ;;
+            PKG_ISCSI="iscsi-initiator-utils"; PKG_MPATH="device-mapper-multipath"
+            AUTOLOGIN_SVC="iscsi" ;;
     esac
 }
 
@@ -386,6 +389,8 @@ PARTIAL_PATH_POLICY="prompt"
 ISCSI_TUNING_PROFILE=""
 ISCSI_CMDS_MAX=""
 ISCSI_QUEUE_DEPTH=""
+NIC_PORTAL_PAIRING=""    # user override: "nic:portal nic:portal ..."
+NIC_PORTAL_PAIRS=""      # derived internal: "iface:portal iface:portal ..."
 
 load_config_file() {
     local path="$OPT_CONFIG"
@@ -544,6 +549,93 @@ interactive_fill() {
 }
 
 # ----------------------------------------------------------------------------
+# NIC ↔ portal pairing
+# ----------------------------------------------------------------------------
+#
+# Each storage NIC pairs with exactly ONE target portal. The pairing is
+# deterministic and identical across every host in the cluster. Loops over
+# (iface × portal) are wrong — they produce N×M sessions instead of the
+# correct min(N,M).
+#
+# Rules:
+#   N NICs, N portals               → positional: nics[i] ↔ portals[i]
+#   1 NIC,  M portals               → single NIC talks to all M portals
+#   N NICs, 1 portal                → all NICs share the one portal
+#   N NICs, M portals, N≠M, N≥2, M≥2 → require explicit NIC_PORTAL_PAIRING
+#
+# NIC_PORTAL_PAIRING format (user-facing):     "eno3:10.10.20.10 eno4:10.10.20.11"
+# NIC_PORTAL_PAIRS format (derived internal):  "iface_eno3:10.10.20.10 iface_eno4:10.10.20.11"
+derive_nic_portal_pairs() {
+    local nics ifaces portals
+    read -ra nics    <<<"$STORAGE_NICS"
+    read -ra ifaces  <<<"$ISCSI_IFACES"
+    read -ra portals <<<"$TARGET_PORTALS"
+
+    local n=${#ifaces[@]} m=${#portals[@]}
+
+    # Explicit override (from config or interactive prompt) wins.
+    if [[ -n "$NIC_PORTAL_PAIRING" ]]; then
+        local p
+        for p in $NIC_PORTAL_PAIRING; do
+            if ! [[ "$p" =~ ^[a-zA-Z0-9_-]+:[0-9.]+$ ]]; then
+                ui_die "NIC_PORTAL_PAIRING entry malformed: '$p' (want nic:portal)"
+            fi
+        done
+        # Translate nic names → iface names using STORAGE_NICS→ISCSI_IFACES map
+        local out=""
+        for p in $NIC_PORTAL_PAIRING; do
+            local nic="${p%%:*}" portal="${p#*:}"
+            local iface=""
+            local i
+            for (( i=0; i<${#nics[@]}; i++ )); do
+                if [[ "${nics[i]}" == "$nic" ]]; then iface="${ifaces[i]}"; break; fi
+            done
+            [[ -z "$iface" ]] && ui_die "NIC_PORTAL_PAIRING references unknown NIC: $nic"
+            out+="${iface}:${portal} "
+        done
+        NIC_PORTAL_PAIRS="${out% }"
+        log "NIC_PORTAL_PAIRS from explicit pairing: $NIC_PORTAL_PAIRS"
+        return
+    fi
+
+    # Derive positionally.
+    local out=""
+    if (( n == m )); then
+        local i
+        for (( i=0; i<n; i++ )); do out+="${ifaces[i]}:${portals[i]} "; done
+    elif (( n == 1 )); then
+        local p
+        for p in "${portals[@]}"; do out+="${ifaces[0]}:${p} "; done
+    elif (( m == 1 )); then
+        local iface
+        for iface in "${ifaces[@]}"; do out+="${iface}:${portals[0]} "; done
+    else
+        # Ambiguous topology. Prompt if we can; otherwise die.
+        if (( OPT_NON_INTERACTIVE )); then
+            ui_die "ambiguous topology: $n NIC(s) × $m portal(s); set NIC_PORTAL_PAIRING explicitly"
+        fi
+        ui_warn "ambiguous topology: $n NICs × $m portals ($n ≠ $m). Explicit pairing needed."
+        ui_info "expected format: 'nic:portal nic:portal ...'"
+        ui_info "example:         '${nics[0]}:${portals[0]} ${nics[1]:-<nic>}:${portals[1]:-<portal>}'"
+        while :; do
+            NIC_PORTAL_PAIRING=$(ui_prompt "NIC↔portal pairing" "")
+            [[ -z "$NIC_PORTAL_PAIRING" ]] && { ui_warn "required"; continue; }
+            local ok=1 p
+            for p in $NIC_PORTAL_PAIRING; do
+                [[ "$p" =~ ^[a-zA-Z0-9_-]+:[0-9.]+$ ]] || { ok=0; break; }
+            done
+            (( ok )) && break
+            ui_warn "one or more entries malformed"
+            NIC_PORTAL_PAIRING=""
+        done
+        derive_nic_portal_pairs  # recurse with explicit pairing now set
+        return
+    fi
+    NIC_PORTAL_PAIRS="${out% }"
+    log "NIC_PORTAL_PAIRS derived positionally: $NIC_PORTAL_PAIRS"
+}
+
+# ----------------------------------------------------------------------------
 # Summary + confirmation
 # ----------------------------------------------------------------------------
 show_summary() {
@@ -561,6 +653,7 @@ show_summary() {
     kv "Target TCP port"     "$TARGET_PORT"
     kv "Storage NICs"        "$STORAGE_NICS"
     kv "iSCSI ifaces"        "$ISCSI_IFACES"
+    kv "NIC ↔ portal pairs"  "$NIC_PORTAL_PAIRS"
     kv "Expected MTU"        "$EXPECTED_MTU"
     if [[ "$SET_INITIATOR_NAME" == "yes" ]]; then
         kv "Initiator name"  "$INITIATOR_NAME_OVERRIDE"
@@ -630,6 +723,20 @@ preflight() {
             needs_enable+=("$svc")
         fi
     done
+
+    # Auto-login-at-boot service: a oneshot (iscsi on RHEL / open-iscsi on
+    # Debian) that runs `iscsiadm -m node --loginall=automatic` at startup.
+    # `node.startup=automatic` on a node record only triggers a login if THIS
+    # service is enabled. Check is-enabled, not is-active.
+    if ! systemctl list-unit-files "${AUTOLOGIN_SVC}.service" >/dev/null 2>&1; then
+        ui_check "service $AUTOLOGIN_SVC (boot auto-login)" warn "unit not present"
+        needs_enable+=("$AUTOLOGIN_SVC")
+    elif systemctl is-enabled --quiet "$AUTOLOGIN_SVC" 2>/dev/null; then
+        ui_check "service $AUTOLOGIN_SVC (boot auto-login)" ok "enabled"
+    else
+        ui_check "service $AUTOLOGIN_SVC (boot auto-login)" warn "not enabled — sessions won't auto-restore on reboot"
+        needs_enable+=("$AUTOLOGIN_SVC")
+    fi
 
     ui_step "Storage NICs"
     local nic
@@ -729,10 +836,23 @@ preflight() {
             fi
         done
         for svc in "${needs_enable[@]}"; do
-            if systemctl enable --now "$svc" >>"$LOG_FILE" 2>&1 && service_active "$svc"; then
-                ui_check "enable + start $svc" ok
+            local svc_ok=0
+            case "$svc" in
+                iscsi|open-iscsi)
+                    # Oneshot — enable for next boot, do NOT --now (would try to
+                    # log into automatic nodes before our apply phase has set any)
+                    if systemctl enable "$svc" >>"$LOG_FILE" 2>&1; then svc_ok=1; fi
+                    ;;
+                *)
+                    # Daemon — enable + start
+                    if systemctl enable --now "$svc" >>"$LOG_FILE" 2>&1 \
+                       && service_active "$svc"; then svc_ok=1; fi
+                    ;;
+            esac
+            if (( svc_ok )); then
+                ui_check "enable $svc" ok
             else
-                ui_check "enable + start $svc" fail
+                ui_check "enable $svc" fail
                 PREFLIGHT_FAILED=1
             fi
         done
@@ -843,90 +963,204 @@ apply_ifaces() {
 }
 
 apply_discovery() {
-    local nics ifaces; read -ra nics <<<"$STORAGE_NICS"; read -ra ifaces <<<"$ISCSI_IFACES"
-    local i portal found_target=0
-    for (( i=0; i<${#ifaces[@]}; i++ )); do
-        local iface="${ifaces[i]}"
-        for portal in $TARGET_PORTALS; do
-            if ui_spinner_run "discovering $iface → $portal" \
-                iscsiadm -m discovery -t sendtargets -I "$iface" -p "$portal"; then
-                # Always log full discovery output for diagnostics
-                {
-                    printf '=== discovery output (%s → %s) ===\n' "$iface" "$portal"
-                    printf '%s\n' "$SPINNER_OUTPUT"
-                    printf '=== end discovery output ===\n'
-                } >>"$LOG_FILE"
-                if grep -q "$TARGET_IQN" <<<"$SPINNER_OUTPUT"; then
-                    ui_check "discover $iface → $portal" ok "found $TARGET_IQN"
-                    found_target=1
-                else
-                    ui_check "discover $iface → $portal" warn "target IQN not in response"
-                fi
-            else
-                ui_check "discover $iface → $portal" fail
-                {
-                    printf '=== FAILED discovery output (%s → %s) ===\n' "$iface" "$portal"
-                    printf '%s\n' "$SPINNER_OUTPUT"
-                    printf '=== end ===\n'
-                } >>"$LOG_FILE"
-                handle_partial_failure "discovery $iface → $portal failed"
-            fi
-        done
-    done
-    if ! (( found_target )); then
-        ui_fail "target IQN $TARGET_IQN was not advertised by any portal — check ACLs/IQN typo"
-        exit 6
+    # ONE discovery is enough — sendtargets returns the full portal list from
+    # the target regardless of which portal we ask, and regardless of iface.
+    # Running discovery N×M times not only wastes work but creates iface-bound
+    # records for every (iface, portal) combination, producing a full mesh.
+    # Use default iface (no -I) so any side-effect records go under "default";
+    # ensure_node_records will build the correct pair records afterward.
+    local first_portal; first_portal=$(echo "$TARGET_PORTALS" | awk '{print $1}')
+
+    if ui_spinner_run "discovering target via default iface → $first_portal" \
+        iscsiadm -m discovery -t sendtargets -p "$first_portal"; then
+        {
+            printf '=== discovery output (default → %s) ===\n' "$first_portal"
+            printf '%s\n' "$SPINNER_OUTPUT"
+            printf '=== end discovery output ===\n'
+        } >>"$LOG_FILE"
+        if grep -q "$TARGET_IQN" <<<"$SPINNER_OUTPUT"; then
+            ui_check "discover default → $first_portal" ok "found $TARGET_IQN"
+        else
+            ui_check "discover default → $first_portal" fail "target IQN not advertised"
+            exit 6
+        fi
+    else
+        ui_check "discover default → $first_portal" fail
+        {
+            printf '=== FAILED discovery output (default → %s) ===\n' "$first_portal"
+            printf '%s\n' "$SPINNER_OUTPUT"
+            printf '=== end ===\n'
+        } >>"$LOG_FILE"
+        handle_partial_failure "discovery via default iface failed"
     fi
 
-    # Log what records actually exist now, for diagnostics
+    # Verify each expected portal is in the response — catches typos and
+    # ACL misconfig on the array early, before ensure_node_records creates
+    # records for portals the array won't accept.
+    local portal
+    for portal in $TARGET_PORTALS; do
+        if grep -qE "^${portal}(:[0-9]+)?," <<<"$SPINNER_OUTPUT"; then
+            ui_check "portal $portal advertised" ok
+        else
+            ui_check "portal $portal advertised" warn "not in sendtargets response"
+        fi
+    done
+
+    # Delete side-effect records discovery just wrote against "default" so
+    # ensure_node_records has a clean slate to build the real pairs.
+    for portal in $TARGET_PORTALS; do
+        iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I default -o delete \
+            >>"$LOG_FILE" 2>&1 || true
+        iscsiadm -m node -T "$TARGET_IQN" -p "${portal}:${TARGET_PORT}" -I default -o delete \
+            >>"$LOG_FILE" 2>&1 || true
+    done
+
+    # Log the state so postmortems have it
     {
-        printf '=== node records after discovery ===\n'
+        printf '=== node records after discovery+cleanup ===\n'
         iscsiadm -m node 2>&1 || true
         printf '=== on-disk node files ===\n'
-        find /var/lib/iscsi/nodes -type f 2>&1 || true
+        find /etc/iscsi/nodes /var/lib/iscsi/nodes -type f 2>/dev/null || true
         printf '=== end ===\n'
     } >>"$LOG_FILE"
 }
 
-# Some iscsiadm builds don't reliably bind discovered records to the iface
-# used during -m discovery; the records land under the "default" iface and
-# subsequent `-m node -I iface_X` calls return "No records found". Explicitly
-# creating per-iface node records here is idempotent and guarantees the
-# CHAP and login steps find what they expect.
-ensure_node_records() {
-    local ifaces; read -ra ifaces <<<"$ISCSI_IFACES"
-    local i portal
-    for (( i=0; i<${#ifaces[@]}; i++ )); do
-        local iface="${ifaces[i]}"
-        for portal in $TARGET_PORTALS; do
-            if iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" \
-                    >/dev/null 2>&1; then
-                ui_check "record $iface → $portal" ok "already bound"
-                continue
+# Locate the node DB base directory for a given target IQN. Distros differ:
+# Debian/Ubuntu use /etc/iscsi/nodes/, RHEL family uses /var/lib/iscsi/nodes/.
+node_db_base() {
+    local iqn="$1"
+    local candidate
+    for candidate in /etc/iscsi/nodes /var/lib/iscsi/nodes; do
+        [[ -d "$candidate/$iqn" ]] && { printf '%s' "$candidate/$iqn"; return; }
+    done
+    return 1
+}
+
+# Return 0 (safe) if losing all iSCSI paths through $portal would still leave
+# ≥1 active path per LUN on this host. Return 1 (unsafe) if any LUN would
+# drop to zero active paths.
+#
+# This gate exists because live-mounted GFS2 will withdraw CLUSTER-WIDE — not
+# just on this node — the moment a mount loses all its paths. Never delete
+# a node record without asking this question first.
+multipath_can_lose_path() {
+    local losing_portal="$1"
+
+    # Fresh install: no multipath state to protect — allow.
+    if ! multipath -ll 2>/dev/null | grep -qE '^[0-9a-fA-F]{16,}'; then
+        return 0
+    fi
+
+    # Identify sdX devices whose active iSCSI session is via $losing_portal
+    local losing_devs
+    losing_devs=$(iscsiadm -m session -P 3 2>/dev/null | awk -v p="$losing_portal" '
+        /Current Portal:/ { in_portal = ($3 ~ "^"p":") }
+        /Attached scsi disk/ && in_portal { for (i=1;i<=NF;i++) if ($i=="disk") print $(i+1) }
+    ')
+    # Nothing currently going through this portal — safe.
+    [[ -z "$losing_devs" ]] && return 0
+
+    multipath -ll 2>/dev/null | awk -v losing="$losing_devs" '
+        BEGIN { split(losing, LA, /\n|[[:space:]]+/); for (k in LA) L[LA[k]]=1 }
+        /^[0-9a-fA-F]{16,}/ { wwid=$1; active[wwid]=0 }
+        /active ready running/ {
+            # Path line: after tree prefix, fields are HCTL, dev, majmin, status...
+            # Find the sdX field
+            for (i=1;i<=NF;i++) if ($i ~ /^sd[a-z]+$/) { dev=$i; break }
+            if (!(dev in L)) active[wwid]++
+        }
+        END { for (w in active) if (active[w] < 1) exit 1; exit 0 }
+    '
+}
+
+# Reconcile: any (iface, portal) node record on disk for our target that is
+# NOT in NIC_PORTAL_PAIRS gets logged out and deleted, after the multipath
+# safety gate confirms losing that path is survivable.
+reconcile_stale_records() {
+    local base
+    base=$(node_db_base "$TARGET_IQN") || {
+        ui_check "reconcile" ok "no existing records"
+        return 0
+    }
+
+    # Build desired set as an associative array for O(1) membership
+    declare -A desired
+    local pair
+    for pair in $NIC_PORTAL_PAIRS; do desired["$pair"]=1; done
+
+    local found_stale=0
+    local portal_dir iface_file
+    for portal_dir in "$base"/*; do
+        [[ -d "$portal_dir" ]] || continue
+        local portal_key="${portal_dir##*/}"    # e.g. "192.168.201.2,3260,1"
+        local portal="${portal_key%%,*}"        # strip port,tpgt
+
+        for iface_file in "$portal_dir"/*; do
+            [[ -f "$iface_file" ]] || continue
+            local iface="${iface_file##*/}"
+            local key="${iface}:${portal}"
+
+            if [[ -n "${desired[$key]:-}" ]]; then continue; fi   # keep
+
+            found_stale=1
+            ui_check "stale record $iface → $portal" warn "not in pairing — will remove"
+
+            # SAFETY GATE — never withdraw a live GFS2 mount cluster-wide
+            if ! multipath_can_lose_path "$portal"; then
+                ui_fail "aborting: multipath cannot afford to lose path via $portal"
+                ui_fail "one or more LUNs would drop to zero active paths"
+                exit 11
             fi
-            # Try explicit IP:port too — match behaviour iscsiadm sometimes wants
-            if iscsiadm -m node -T "$TARGET_IQN" -p "${portal}:${TARGET_PORT}" -I "$iface" \
-                    >/dev/null 2>&1; then
-                ui_check "record $iface → $portal" ok "already bound (with port)"
-                continue
-            fi
-            local err
-            if err=$(iscsiadm -m node -o new \
-                        -T "$TARGET_IQN" \
-                        -p "${portal}:${TARGET_PORT}" \
-                        -I "$iface" 2>&1); then
-                ui_check "record $iface → $portal" ok "created"
-                printf 'created node record: %s\n' "$err" >>"$LOG_FILE"
+
+            # Logout live session for this record (ignore errors — may not be up)
+            iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" --logout \
+                >>"$LOG_FILE" 2>&1 || true
+
+            if iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" -o delete \
+                    >>"$LOG_FILE" 2>&1; then
+                ui_check "stale record $iface → $portal" ok "removed"
             else
-                ui_check "record $iface → $portal" fail
-                local line
-                while IFS= read -r line; do
-                    [[ -n "$line" ]] && ui_info "iscsiadm: $line"
-                done <<<"$err"
-                log "ensure_node_records failed on $iface → $portal: $err"
-                handle_partial_failure "could not create node record for $iface → $portal"
+                ui_check "stale record $iface → $portal" fail "delete failed"
+                handle_partial_failure "could not delete stale record $iface → $portal"
             fi
         done
+    done
+    (( found_stale )) || ui_check "reconcile" ok "no stale records"
+}
+
+# Create exactly the node records we want, one per (iface, portal) pair.
+# Idempotent: if a record already exists it's a no-op.
+ensure_node_records() {
+    reconcile_stale_records
+
+    local pair
+    for pair in $NIC_PORTAL_PAIRS; do
+        local iface="${pair%%:*}" portal="${pair#*:}"
+
+        if iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" \
+                >/dev/null 2>&1 \
+           || iscsiadm -m node -T "$TARGET_IQN" -p "${portal}:${TARGET_PORT}" -I "$iface" \
+                >/dev/null 2>&1; then
+            ui_check "record $iface → $portal" ok "already bound"
+            continue
+        fi
+
+        local err
+        if err=$(iscsiadm -m node -o new \
+                    -T "$TARGET_IQN" \
+                    -p "${portal}:${TARGET_PORT}" \
+                    -I "$iface" 2>&1); then
+            ui_check "record $iface → $portal" ok "created"
+            printf 'created node record: %s\n' "$err" >>"$LOG_FILE"
+        else
+            ui_check "record $iface → $portal" fail
+            local line
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && ui_info "iscsiadm: $line"
+            done <<<"$err"
+            log "ensure_node_records failed on $iface → $portal: $err"
+            handle_partial_failure "could not create node record for $iface → $portal"
+        fi
     done
 }
 
@@ -980,26 +1214,24 @@ apply_iscsid_tuning() {
         ui_check "iscsid.conf" warn "not found at $f — global tuning skipped"
     fi
 
-    # 2) Update existing node records for THIS target so values apply at login
-    local ifaces; read -ra ifaces <<<"$ISCSI_IFACES"
-    local i portal
-    for (( i=0; i<${#ifaces[@]}; i++ )); do
-        local iface="${ifaces[i]}"
-        for portal in $TARGET_PORTALS; do
-            local portal_spec="$portal"
-            if ! iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" >/dev/null 2>&1 \
-               && iscsiadm -m node -T "$TARGET_IQN" -p "${portal}:${TARGET_PORT}" -I "$iface" >/dev/null 2>&1; then
-                portal_spec="${portal}:${TARGET_PORT}"
-            fi
-            if iscsiadm -m node -T "$TARGET_IQN" -p "$portal_spec" -I "$iface" \
-                    --op=update -n node.session.cmds_max -v "$cmds_max" >>"$LOG_FILE" 2>&1 \
-               && iscsiadm -m node -T "$TARGET_IQN" -p "$portal_spec" -I "$iface" \
-                    --op=update -n node.session.queue_depth -v "$queue_depth" >>"$LOG_FILE" 2>&1; then
-                ui_check "tuned $iface → $portal" ok "cmds=$cmds_max qd=$queue_depth"
-            else
-                ui_check "tuned $iface → $portal" warn "per-record update failed (see log)"
-            fi
-        done
+    # 2) Update the node records we actually plan to use (one per pair —
+    #    not the Cartesian product) so tuning applies at next login.
+    local pair
+    for pair in $NIC_PORTAL_PAIRS; do
+        local iface="${pair%%:*}" portal="${pair#*:}"
+        local portal_spec="$portal"
+        if ! iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" >/dev/null 2>&1 \
+           && iscsiadm -m node -T "$TARGET_IQN" -p "${portal}:${TARGET_PORT}" -I "$iface" >/dev/null 2>&1; then
+            portal_spec="${portal}:${TARGET_PORT}"
+        fi
+        if iscsiadm -m node -T "$TARGET_IQN" -p "$portal_spec" -I "$iface" \
+                --op=update -n node.session.cmds_max -v "$cmds_max" >>"$LOG_FILE" 2>&1 \
+           && iscsiadm -m node -T "$TARGET_IQN" -p "$portal_spec" -I "$iface" \
+                --op=update -n node.session.queue_depth -v "$queue_depth" >>"$LOG_FILE" 2>&1; then
+            ui_check "tuned $iface → $portal" ok "cmds=$cmds_max qd=$queue_depth"
+        else
+            ui_check "tuned $iface → $portal" warn "per-record update failed (see log)"
+        fi
     done
 
     # 3) Warn if pre-existing sessions exist — they keep old values until re-login
@@ -1096,35 +1328,41 @@ apply_login_and_chap() {
         fi
     done
 
-    # Explicit per-portal --login (final, authoritative)
-    for (( i=0; i<${#ifaces[@]}; i++ )); do
-        local iface="${ifaces[i]}"
-        for portal in $TARGET_PORTALS; do
-            local err
-            if err=$(iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" --login 2>&1); then
-                ui_check "login $iface → $portal" ok
-            elif grep -qiE 'session.*exists|already (logged in|exist)' <<<"$err"; then
-                ui_check "login $iface → $portal" ok "already logged in"
-            else
-                ui_check "login $iface → $portal" fail
-                local line
-                while IFS= read -r line; do
-                    [[ -n "$line" ]] && ui_info "iscsiadm: $line"
-                done <<<"$err"
-                log "login failed on $iface → $portal: $err"
-                handle_partial_failure "login $iface → $portal failed"
-            fi
-        done
+    # Explicit per-pair --login (final, authoritative). Iterates pairs so we
+    # log in exactly the sessions we want — not the Cartesian product.
+    local pair
+    for pair in $NIC_PORTAL_PAIRS; do
+        local iface="${pair%%:*}" portal="${pair#*:}"
+        local err
+        if err=$(iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" --login 2>&1); then
+            ui_check "login $iface → $portal" ok
+        elif grep -qiE 'session.*exists|already (logged in|exist)' <<<"$err"; then
+            ui_check "login $iface → $portal" ok "already logged in"
+        else
+            ui_check "login $iface → $portal" fail
+            local line
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && ui_info "iscsiadm: $line"
+            done <<<"$err"
+            log "login failed on $iface → $portal: $err"
+            handle_partial_failure "login $iface → $portal failed"
+        fi
     done
 }
 
 apply_autostart() {
-    local portal
-    for portal in $TARGET_PORTALS; do
-        iscsiadm -m node -T "$TARGET_IQN" -p "$portal" \
-            --op update -n node.startup -v automatic >>"$LOG_FILE" 2>&1 \
-            && ui_check "node.startup=automatic ($portal)" ok \
-            || ui_check "node.startup=automatic ($portal)" warn "non-fatal"
+    # Iterate pairs (with explicit -I iface) so we set node.startup=automatic
+    # only on the records we own — never on other targets' records that
+    # happen to share a portal IP.
+    local pair
+    for pair in $NIC_PORTAL_PAIRS; do
+        local iface="${pair%%:*}" portal="${pair#*:}"
+        if iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" \
+                --op update -n node.startup -v automatic >>"$LOG_FILE" 2>&1; then
+            ui_check "node.startup=automatic ($iface → $portal)" ok
+        else
+            ui_check "node.startup=automatic ($iface → $portal)" warn "non-fatal"
+        fi
     done
 }
 
@@ -1208,6 +1446,46 @@ phase_verify() {
         done <<<"$mp"
     fi
     printf '  %s' "${C_DIM}"; printf '─%.0s' $(seq 1 70); printf '%s\n' "${C_RESET}"
+
+    ui_step "Persistence (reboot survival)"
+    local persist_ok=1
+    if systemctl is-enabled --quiet iscsid 2>/dev/null; then
+        ui_check "iscsid enabled at boot" ok
+    else
+        ui_check "iscsid enabled at boot" fail; persist_ok=0
+    fi
+    if systemctl is-enabled --quiet multipathd 2>/dev/null; then
+        ui_check "multipathd enabled at boot" ok
+    else
+        ui_check "multipathd enabled at boot" fail; persist_ok=0
+    fi
+    if systemctl is-enabled --quiet "$AUTOLOGIN_SVC" 2>/dev/null; then
+        ui_check "$AUTOLOGIN_SVC enabled at boot (auto-login)" ok
+    else
+        ui_check "$AUTOLOGIN_SVC enabled at boot (auto-login)" fail
+        persist_ok=0
+    fi
+    # Count node records with node.startup=automatic — iterate pairs, not Cartesian
+    local auto_count=0
+    local pair startup
+    for pair in $NIC_PORTAL_PAIRS; do
+        local iface="${pair%%:*}" portal="${pair#*:}"
+        startup=$(iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" --op=show 2>/dev/null \
+            | awk -F'=' '$1 ~ /node\.startup[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}' \
+            | head -1)
+        [[ "$startup" == "automatic" ]] && (( auto_count++ ))
+    done
+    if (( auto_count > 0 )); then
+        ui_check "node.startup=automatic" ok "$auto_count record(s)"
+    else
+        ui_check "node.startup=automatic" fail "no node records set to automatic"
+        persist_ok=0
+    fi
+    if (( persist_ok )); then
+        ui_ok "reboot persistence verified — sessions will auto-restore"
+    else
+        ui_warn "reboot persistence incomplete — see failures above"
+    fi
 
     ui_phase_end
 
@@ -1320,6 +1598,7 @@ main() {
     else
         interactive_fill
     fi
+    derive_nic_portal_pairs
     ui_phase_end
 
     show_summary

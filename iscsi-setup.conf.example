@@ -50,6 +50,23 @@ STORAGE_NICS=""
 #   ISCSI_IFACES="iface_eno3 iface_eno4"
 ISCSI_IFACES=""
 
+# NIC ↔ portal pairing. Each storage NIC pairs with exactly ONE portal
+# (running discovery + login across every NIC × every portal produces a
+# full mesh with 2× the sessions you want, and 2× the multipath paths).
+#
+# Leave blank to derive automatically:
+#   N NICs, N portals:              positional — nics[i] ↔ portals[i]
+#   1 NIC,  M portals:              single NIC talks to all M portals
+#   N NICs, 1 portal:               all N NICs share the one portal
+#   N NICs, M portals, N ≠ M ≥ 2:   ambiguous — set explicitly below
+#
+# Explicit format is space-separated "nic:portal" entries:
+#   NIC_PORTAL_PAIRING="eno3:10.10.20.10 eno4:10.10.20.11"
+#
+# Convention: pair lower-numbered NICs with lower-numbered portals so
+# operator debugging stays consistent across every host in the cluster.
+NIC_PORTAL_PAIRING=""
+
 # Expected MTU on the storage NICs. Used for jumbo-frame validation
 # (the script pings with the DF bit set and the corresponding payload size).
 # Common values: 1500 (standard) or 9000 (jumbo).
