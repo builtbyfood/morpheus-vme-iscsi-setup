@@ -25,7 +25,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.2"
 SCRIPT_NAME="vme-iscsi-setup"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -315,6 +315,23 @@ jumbo_ping_via() {
 tcp_open() {
     # tcp_open <ip> <port>  (3s timeout)
     timeout 3 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+}
+
+# Look up the underlying NIC name for a given iSCSI iface name, using the
+# parallel STORAGE_NICS / ISCSI_IFACES arrays.
+nic_for_iface() {
+    local target_iface="$1"
+    local nics ifaces
+    read -ra nics <<<"$STORAGE_NICS"
+    read -ra ifaces <<<"$ISCSI_IFACES"
+    local i
+    for (( i=0; i<${#ifaces[@]}; i++ )); do
+        if [[ "${ifaces[i]}" == "$target_iface" ]]; then
+            printf '%s' "${nics[i]}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # ----------------------------------------------------------------------------
@@ -771,22 +788,30 @@ preflight() {
     local payload=1472
     [[ "$EXPECTED_MTU" == "9000" ]] && payload=8972
 
-    local portal
-    for nic in $STORAGE_NICS; do
-        for portal in $TARGET_PORTALS; do
-            if ping_via "$nic" "$portal"; then
-                ui_check "ping $nic → $portal (1pkt)" ok
-            else
-                ui_check "ping $nic → $portal (1pkt)" fail
-                PREFLIGHT_FAILED=1
-                continue
-            fi
-            if jumbo_ping_via "$nic" "$portal" "$payload"; then
-                ui_check "jumbo ping $nic → $portal (DF, ${payload}B)" ok
-            else
-                ui_check "jumbo ping $nic → $portal (DF, ${payload}B)" warn "MTU mismatch or fragmentation"
-            fi
-        done
+    # Iterate the pairing, not the Cartesian product. On L3-segmented setups
+    # (each NIC on its own subnet, each portal reachable only from its
+    # paired NIC), pinging every NIC against every portal produces
+    # false-negative failures for the routing-impossible combinations.
+    local pair
+    for pair in $NIC_PORTAL_PAIRS; do
+        local iface="${pair%%:*}" portal="${pair#*:}"
+        local nic; nic=$(nic_for_iface "$iface") || {
+            ui_check "ping (pair $pair)" fail "iface not in ISCSI_IFACES"
+            PREFLIGHT_FAILED=1
+            continue
+        }
+        if ping_via "$nic" "$portal"; then
+            ui_check "ping $nic → $portal (1pkt)" ok
+        else
+            ui_check "ping $nic → $portal (1pkt)" fail
+            PREFLIGHT_FAILED=1
+            continue
+        fi
+        if jumbo_ping_via "$nic" "$portal" "$payload"; then
+            ui_check "jumbo ping $nic → $portal (DF, ${payload}B)" ok
+        else
+            ui_check "jumbo ping $nic → $portal (DF, ${payload}B)" warn "MTU mismatch or fragmentation"
+        fi
     done
 
     for portal in $TARGET_PORTALS; do
@@ -963,61 +988,67 @@ apply_ifaces() {
 }
 
 apply_discovery() {
-    # ONE discovery is enough — sendtargets returns the full portal list from
-    # the target regardless of which portal we ask, and regardless of iface.
-    # Running discovery N×M times not only wastes work but creates iface-bound
-    # records for every (iface, portal) combination, producing a full mesh.
-    # Use default iface (no -I) so any side-effect records go under "default";
-    # ensure_node_records will build the correct pair records afterward.
-    local first_portal; first_portal=$(echo "$TARGET_PORTALS" | awk '{print $1}')
+    # Discovery runs per pair — one iscsiadm sendtargets via each iface to
+    # its paired portal. This is safe (min(N,M) discoveries, never the
+    # Cartesian product), and it's *required* on strict L3-segmented setups
+    # where each NIC is on its own /24 with no route to the other subnet:
+    # running discovery via "default" iface would let the kernel pick a
+    # source based on routing rules and fail for portals it can't reach.
+    #
+    # Each discovery may create iface-bound records for the portal it hit
+    # (correct), and possibly for OTHER portals the target advertises in
+    # its sendtargets response (unwanted). ensure_node_records will reconcile
+    # those unwanted records against NIC_PORTAL_PAIRS.
+    local pair advertised_all=""
+    local found_target=0
+    for pair in $NIC_PORTAL_PAIRS; do
+        local iface="${pair%%:*}" portal="${pair#*:}"
 
-    if ui_spinner_run "discovering target via default iface → $first_portal" \
-        iscsiadm -m discovery -t sendtargets -p "$first_portal"; then
-        {
-            printf '=== discovery output (default → %s) ===\n' "$first_portal"
-            printf '%s\n' "$SPINNER_OUTPUT"
-            printf '=== end discovery output ===\n'
-        } >>"$LOG_FILE"
-        if grep -q "$TARGET_IQN" <<<"$SPINNER_OUTPUT"; then
-            ui_check "discover default → $first_portal" ok "found $TARGET_IQN"
+        if ui_spinner_run "discovering $iface → $portal" \
+            iscsiadm -m discovery -t sendtargets -I "$iface" -p "$portal"; then
+            {
+                printf '=== discovery output (%s → %s) ===\n' "$iface" "$portal"
+                printf '%s\n' "$SPINNER_OUTPUT"
+                printf '=== end discovery output ===\n'
+            } >>"$LOG_FILE"
+            if grep -q "$TARGET_IQN" <<<"$SPINNER_OUTPUT"; then
+                ui_check "discover $iface → $portal" ok "found $TARGET_IQN"
+                found_target=1
+                advertised_all+="${SPINNER_OUTPUT}"$'\n'
+            else
+                ui_check "discover $iface → $portal" warn "target IQN not in response"
+            fi
         else
-            ui_check "discover default → $first_portal" fail "target IQN not advertised"
-            exit 6
-        fi
-    else
-        ui_check "discover default → $first_portal" fail
-        {
-            printf '=== FAILED discovery output (default → %s) ===\n' "$first_portal"
-            printf '%s\n' "$SPINNER_OUTPUT"
-            printf '=== end ===\n'
-        } >>"$LOG_FILE"
-        handle_partial_failure "discovery via default iface failed"
-    fi
-
-    # Verify each expected portal is in the response — catches typos and
-    # ACL misconfig on the array early, before ensure_node_records creates
-    # records for portals the array won't accept.
-    local portal
-    for portal in $TARGET_PORTALS; do
-        if grep -qE "^${portal}(:[0-9]+)?," <<<"$SPINNER_OUTPUT"; then
-            ui_check "portal $portal advertised" ok
-        else
-            ui_check "portal $portal advertised" warn "not in sendtargets response"
+            ui_check "discover $iface → $portal" fail
+            {
+                printf '=== FAILED discovery output (%s → %s) ===\n' "$iface" "$portal"
+                printf '%s\n' "$SPINNER_OUTPUT"
+                printf '=== end ===\n'
+            } >>"$LOG_FILE"
+            handle_partial_failure "discovery $iface → $portal failed"
         fi
     done
 
-    # Delete side-effect records discovery just wrote against "default" so
-    # ensure_node_records has a clean slate to build the real pairs.
+    if ! (( found_target )); then
+        ui_fail "target IQN $TARGET_IQN was not advertised on any pair — check ACLs/IQN typo"
+        exit 6
+    fi
+
+    # Verify each expected portal appeared in at least one discovery response.
+    # (Some arrays only advertise the local portal; that's fine — the
+    # per-pair discovery still creates the right record. Just a warning.)
+    local portal
     for portal in $TARGET_PORTALS; do
-        iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I default -o delete \
-            >>"$LOG_FILE" 2>&1 || true
-        iscsiadm -m node -T "$TARGET_IQN" -p "${portal}:${TARGET_PORT}" -I default -o delete \
-            >>"$LOG_FILE" 2>&1 || true
+        if grep -qE "^${portal}(:[0-9]+)?," <<<"$advertised_all"; then
+            ui_check "portal $portal advertised" ok
+        else
+            ui_check "portal $portal advertised" warn "not in sendtargets response (per-pair discovery still handles this)"
+        fi
     done
 
     # Log the state so postmortems have it
     {
-        printf '=== node records after discovery+cleanup ===\n'
+        printf '=== node records after discovery ===\n'
         iscsiadm -m node 2>&1 || true
         printf '=== on-disk node files ===\n'
         find /etc/iscsi/nodes /var/lib/iscsi/nodes -type f 2>/dev/null || true
@@ -1336,7 +1367,7 @@ apply_login_and_chap() {
         local err
         if err=$(iscsiadm -m node -T "$TARGET_IQN" -p "$portal" -I "$iface" --login 2>&1); then
             ui_check "login $iface → $portal" ok
-        elif grep -qiE 'session.*exists|already (logged in|exist)' <<<"$err"; then
+        elif grep -qiE 'session.*exists|already (logged in|exist)|session requested.*already present' <<<"$err"; then
             ui_check "login $iface → $portal" ok "already logged in"
         else
             ui_check "login $iface → $portal" fail
